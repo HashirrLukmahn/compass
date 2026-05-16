@@ -107,7 +107,7 @@ export async function createDecisionBrief(
 		page_id: opportunityPageId,
 		properties: {
 			Status: { select: { name: "Decision Ready" } },
-			"Brief Page/Event Page": { url: pageUrl },
+			"Brief Page": { url: pageUrl },
 		},
 	});
 

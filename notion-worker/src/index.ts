@@ -138,7 +138,7 @@ async function processDecision(notion: Client, props: Props): Promise<string> {
 	const cost = getNumber(props, "Cost") ?? 0;
 	const category = getCategory(props, "Category");
 	const eventDate = getDate(props, "Event Start Date");
-	const briefUrl = getUrl(props, "Brief Page/Event Page") ?? "";
+	const briefUrl = getUrl(props, "Brief Page") ?? "";
 
 	console.log(`[Compass] Decision: ${opportunityName} → ${status}`);
 
