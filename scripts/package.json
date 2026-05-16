@@ -1,0 +1,16 @@
+{
+  "name": "compass-scripts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "seed": "tsx seed-demo-data.ts"
+  },
+  "dependencies": {
+    "@notionhq/client": "^5.21.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.0"
+  }
+}
