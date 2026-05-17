@@ -8,6 +8,9 @@ import { getActiveBudget, deductFromBudget } from "./budget.js";
 import { researchOpportunity } from "./research.js";
 import { createDecisionBrief } from "./brief.js";
 import { collectOutcomes } from "./outcome.js";
+import { buildAgentSummary, writeAgentSummary } from "./agent-summary.js";
+import { findAlternatives, findAlternativesForOpportunity } from "./alternatives.js";
+import { parseOpportunityUrl, createOpportunityRow, resolveOpportunityByName } from "./intake.js";
 
 const worker = new Worker();
 export default worker;
@@ -37,12 +40,9 @@ async function loadPageProps(
 	notion: Client,
 	body: Record<string, unknown>,
 ): Promise<{ pageId: string; props: Props } | null> {
-	// Fast path: Notion automation payloads embed the full page object in `data`.
-	const data = body.data as { id?: string; properties?: Props } | undefined;
-	if (data?.id && data.properties && typeof data.properties === "object") {
-		return { pageId: data.id, props: data.properties };
-	}
-
+	// Always fetch canonical page data by ID. Notion automation webhook payloads
+	// may embed a non-canonical / pre-edit properties snapshot in `body.data`,
+	// so trusting it caused the decision webhook to read a stale Status.
 	const pageId = extractPageId(body);
 	if (!pageId) {
 		console.log("[Compass] Could not find page ID in webhook body. Keys:", Object.keys(body));
@@ -77,6 +77,11 @@ async function researchAndBrief(
 	if (status && status !== "New") {
 		return `Skipping "${opportunityName}" — status is "${status}".`;
 	}
+	// Idempotency: a brief already exists, so a prior run handled this row.
+	// Notion automations can fire more than once for one logical change.
+	if (getUrl(props, "Brief Page")) {
+		return `Skipping "${opportunityName}" — a Decision Brief already exists.`;
+	}
 
 	await notion.pages.update({
 		page_id: pageId,
@@ -107,6 +112,12 @@ async function researchAndBrief(
 		pageId,
 	);
 
+	try {
+		await writeAgentSummary(notion, pageId, buildAgentSummary(briefData, cost, budget));
+	} catch (err) {
+		console.log("[Compass] Could not write Agent Summary — continuing.", err);
+	}
+
 	const summary = `${briefData.recommendation} (${briefData.confidence}) — ${briefUrl}`;
 	console.log(`[Compass] Brief ready: ${summary}`);
 	return summary;
@@ -128,7 +139,7 @@ worker.webhook("onNewOpportunity", {
 
 // Wire in Notion: Opportunity Inbox → automation "When Status changes" →
 // Send webhook → this webhook's URL.
-async function processDecision(notion: Client, props: Props): Promise<string> {
+async function processDecision(notion: Client, pageId: string, props: Props): Promise<string> {
 	const status = getSelect(props, "Status");
 	if (status !== "Approved" && status !== "Rejected") {
 		return `Status "${status}" is not a final decision, skipping.`;
@@ -147,7 +158,10 @@ async function processDecision(notion: Client, props: Props): Promise<string> {
 	if (status === "Approved") {
 		const budget = await getActiveBudget(notion);
 		if (budget) {
-			await deductFromBudget(notion, budget.id, cost, budget.spent);
+			await deductFromBudget(notion, budget.id, cost, budget.spent, {
+					opportunityName,
+					opportunityUrl: `https://notion.so/${pageId.replace(/-/g, "")}`,
+				});
 			console.log(`[Compass] Deducted $${cost} from ${budget.label}`);
 		}
 		try {
@@ -179,6 +193,15 @@ async function processDecision(notion: Client, props: Props): Promise<string> {
 		briefUrl,
 		baselineStars,
 	});
+	if (status === "Rejected") {
+		try {
+			const alts = await findAlternatives(notion, props);
+			console.log(`[Compass] Found ${alts.length} alternatives for "${opportunityName}":`, JSON.stringify(alts));
+		} catch (err) {
+			console.log("[Compass] findAlternatives failed — reject flow unaffected.", err);
+		}
+	}
+
 	const msg = `Logged to Decision Log: ${opportunityName} → ${status}`;
 	console.log(`[Compass] ${msg}`);
 	return msg;
@@ -191,7 +214,7 @@ worker.webhook("onDecisionMade", {
 		for (const event of events) {
 			const loaded = await loadPageProps(notion, event.body);
 			if (!loaded) continue;
-			await processDecision(notion, loaded.props);
+			await processDecision(notion, loaded.pageId, loaded.props);
 		}
 	},
 });
@@ -236,9 +259,102 @@ worker.tool("runDecision", {
 	}),
 	execute: async ({ pageId }, { notion }) => {
 		const page = (await notion.pages.retrieve({ page_id: pageId })) as unknown as {
+			id: string;
 			properties?: Props;
 		};
 		if (!page.properties) return "Page has no properties.";
-		return await processDecision(notion, page.properties);
+		return await processDecision(notion, page.id, page.properties);
+	},
+});
+
+// Called by the Notion agent when a user rejects an opportunity verbally.
+// Auto-detects the most recently rejected row — no parameter needed.
+worker.tool("findAlternatives", {
+	title: "Find Alternative Opportunities",
+	description:
+		"Finds 3 real alternative events for a rejected opportunity. Pass the name of the rejected opportunity (e.g. 'KubeCon Europe 2026'). Call this immediately after a rejection.",
+	schema: j.object({
+		name: j
+			.string()
+			.describe("The name of the rejected opportunity, exactly as it appears in the Opportunity Inbox."),
+	}),
+	execute: async ({ name }, { notion }) => {
+		const alts = await findAlternativesForOpportunity(notion, name);
+		if (alts.length === 0) return "No alternatives found.";
+		return JSON.stringify(alts);
+	},
+});
+
+// Agent: paste an event URL → parse it into structured fields. Creates NOTHING.
+// If cost (or name) can't be found, it's listed in `missing` so the agent can
+// ask the user before anything is created.
+worker.tool("addOpportunityFromUrl", {
+	title: "Parse Opportunity From URL",
+	description:
+		"Parses an event URL into structured fields. Does NOT create anything. Returns {extracted, missing}. If `missing` is non-empty (e.g. cost), ASK THE USER for those values, then call createOpportunity.",
+	schema: j.object({
+		url: j.string().describe("The event or conference URL to parse."),
+	}),
+	execute: async ({ url }) => {
+		const { extracted, missing } = await parseOpportunityUrl(url);
+		return JSON.stringify({ extracted, missing });
+	},
+});
+
+// Agent: create the opportunity once all fields are known (from the URL parse
+// plus any values the user supplied), then run the full research pipeline.
+worker.tool("createOpportunity", {
+	title: "Create And Evaluate Opportunity",
+	description:
+		"Creates an Opportunity Inbox row and runs research, producing a Decision Brief. Call only when name and cost are known. Pass empty string for eventStartDate or notes if unknown.",
+	schema: j.object({
+		name: j.string().describe("Event name."),
+		cost: j.number().describe("Attendance or sponsorship cost in USD."),
+		category: j
+			.string()
+			.describe("One of: Conference, Sponsorship, Meetup, Newsletter, Demo Night, Founder/VC Meeting, Others."),
+		eventStartDate: j.string().describe("ISO date YYYY-MM-DD, or empty string if unknown."),
+		notes: j.string().describe("One-sentence description, or empty string."),
+	}),
+	execute: async ({ name, cost, category, eventStartDate, notes }, { notion }) => {
+		const pageId = await createOpportunityRow(notion, {
+			name,
+			cost,
+			category,
+			eventStartDate: eventStartDate || undefined,
+			notes: notes || undefined,
+		});
+		const page = (await notion.pages.retrieve({ page_id: pageId })) as unknown as {
+			id: string;
+			properties?: Props;
+		};
+		if (!page.properties) return "Opportunity created but properties could not be read.";
+		return await researchAndBrief(notion, page.id, page.properties);
+	},
+});
+
+// Agent: approve or reject an opportunity by name. Sets Status then runs the
+// decision pipeline (budget + log + ledger, or log + alternatives on reject).
+worker.tool("decideOpportunity", {
+	title: "Approve Or Reject Opportunity",
+	description:
+		"Approves or rejects an opportunity by name. On Approve: deducts budget + logs. On Reject: logs + (use findAlternatives next).",
+	schema: j.object({
+		name: j.string().describe("The opportunity name as it appears in the Opportunity Inbox."),
+		decision: j.enum("Approved", "Rejected").describe("The decision to apply."),
+	}),
+	execute: async ({ name, decision }, { notion }) => {
+		const resolved = await resolveOpportunityByName(notion, name);
+		if (!resolved) return `Could not find an opportunity matching "${name}".`;
+		await notion.pages.update({
+			page_id: resolved.pageId,
+			properties: { Status: { select: { name: decision } } },
+		});
+		const page = (await notion.pages.retrieve({ page_id: resolved.pageId })) as unknown as {
+			id: string;
+			properties?: Props;
+		};
+		if (!page.properties) return "Status updated but properties could not be read.";
+		return await processDecision(notion, page.id, page.properties);
 	},
 });

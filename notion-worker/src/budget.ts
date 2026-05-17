@@ -67,11 +67,35 @@ export async function deductFromBudget(
 	budgetId: string,
 	amount: number,
 	currentSpent: number,
+	transaction: { opportunityName: string; opportunityUrl: string },
 ): Promise<void> {
 	await notion.pages.update({
 		page_id: budgetId,
 		properties: {
 			Spent: { number: currentSpent + amount },
 		},
+	});
+
+	const date = new Date().toISOString().slice(0, 10);
+	await notion.blocks.children.append({
+		block_id: budgetId,
+		children: [
+			{
+				type: "bulleted_list_item",
+				bulleted_list_item: {
+					rich_text: [
+						{ type: "text", text: { content: `$${amount.toLocaleString()} — ` } },
+						{
+							type: "text",
+							text: {
+								content: transaction.opportunityName,
+								link: { url: transaction.opportunityUrl },
+							},
+						},
+						{ type: "text", text: { content: ` · ${date}` } },
+					],
+				},
+			},
+		],
 	});
 }
